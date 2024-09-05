@@ -1,6 +1,7 @@
 from __future__ import absolute_import
 
-import os.path
+from typing import Optional
+
 from skimage import draw
 from scipy.ndimage import filters, morphology
 import cv2
@@ -8,24 +9,19 @@ import numpy as np
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
 
-from ocrd import Processor
+from ocrd import Processor, OcrdPageResult
 from ocrd_utils import (
-    getLogger,
-    make_file_id,
-    assert_file_grp_cardinality,
     coordinates_for_segment,
     coordinates_of_segment,
     polygon_from_points,
     points_from_polygon,
     xywh_from_polygon,
-    MIMETYPE_PAGE
 )
-from ocrd_modelfactory import page_from_file
 from ocrd_models.ocrd_page import (
+    OcrdPage,
     PageType,
     BorderType,
     TextRegionType,
-    to_xml
 )
 from ocrd_models.ocrd_page_generateds import (
     RegionRefType,
@@ -42,22 +38,23 @@ from ocrd_validators.page_validator import (
     CoordinateValidityError,
     PageValidator
 )
-from .config import OCRD_TOOL
-from .project import join_polygons, make_valid
 
-TOOL = 'ocrd-segment-repair'
+from .project import join_polygons, make_valid
 
 class RepairSegmentation(Processor):
 
-    def __init__(self, *args, **kwargs):
-        kwargs['ocrd_tool'] = OCRD_TOOL['tools'][TOOL]
-        kwargs['version'] = OCRD_TOOL['version']
-        super(RepairSegmentation, self).__init__(*args, **kwargs)
+    @property
+    def executable(self):
+        return 'ocrd-segment-repair'
 
-    def process(self):
+    def setup(self):
+        # be strict regarding polygon path validity (so this can be repaired)
+        ocrd_validators.page_validator.POLY_TOLERANCE = 0
+
+    def process_page_pcgts(self, *input_pcgts: Optional[OcrdPage], page_id: Optional[str] = None) -> OcrdPageResult:
         """Perform generic post-processing of page segmentation with Shapely and OpenCV.
 
-        Open and deserialize PAGE input files and their respective images,
+        Open and deserialize PAGE input file and its respective images,
         then validate syntax and semantics, checking for invalid or inconsistent
         segmentation. Fix invalidities by simplifying and/or re-ordering polygon paths.
         Fix inconsistencies by shrinking segment polygons to their parents. Log
@@ -105,108 +102,88 @@ class RepairSegmentation(Processor):
         region outline, as if extended by ``sanitize_padding``. If ``spread`` is
         non-zero and ``spread_level=region``, then this still applies to the result.)
 
-        Finally, produce new output files by serialising the resulting hierarchy.
+        Finally, produce new output file by serialising the resulting hierarchy.
         """
-        LOG = getLogger('processor.RepairSegmentation')
-        assert_file_grp_cardinality(self.input_file_grp, 1)
-        assert_file_grp_cardinality(self.output_file_grp, 1)
-        # be strict regarding polygon path validity (so this can be repaired)
-        ocrd_validators.page_validator.POLY_TOLERANCE = 0
+        pcgts = input_pcgts[0]
+        page = pcgts.get_Page()
 
-        for n, input_file in enumerate(self.input_files):
-            file_id = make_file_id(input_file, self.output_file_grp)
-            page_id = input_file.pageId or input_file.ID
-            LOG.info("INPUT FILE %i / %s", n, page_id)
-            pcgts = page_from_file(self.workspace.download_file(input_file))
-            self.add_metadata(pcgts)
-            pcgts.set_pcGtsId(file_id)
-            page = pcgts.get_Page()
-
-            # shrink/expand text regions to the hull of their text lines
-            if self.parameter['sanitize']:
-                page_image, page_coords, _ = self.workspace.image_from_page(
-                    page, page_id,
-                    feature_selector='binarized',
-                    feature_filter='clipped')
-                shrink_regions(page_image, page_coords, page, page_id,
-                               padding=self.parameter['sanitize_padding'])
-            #
-            # validate segmentation (warn of children extending beyond their parents)
-            #
-            report = PageValidator.validate(ocrd_page=pcgts,
-                                            page_textequiv_consistency='off',
-                                            check_baseline=False)
-            if not report.is_valid:
-                errors = report.errors
-                report.errors = []
-                for error in errors:
-                    if isinstance(error, (CoordinateConsistencyError,CoordinateValidityError)):
-                        if error.tag == 'Page':
-                            element = page.get_Border()
-                        elif error.tag.endswith('Region'):
-                            element = next((region
-                                            for region in page.get_AllRegions()
-                                            if region.id == error.ID), None)
-                        elif error.tag == 'TextLine':
-                            element = next((line
-                                            for region in page.get_AllRegions(classes=['Text'])
-                                            for line in region.get_TextLine()
-                                            if line.id == error.ID), None)
-                        elif error.tag == 'Word':
-                            element = next((word
-                                            for region in page.get_AllRegions(classes=['Text'])
-                                            for line in region.get_TextLine()
-                                            for word in line.get_Word()
-                                            if word.id == error.ID), None)
-                        elif error.tag == 'Glyph':
-                            element = next((glyph
-                                            for region in page.get_AllRegions(classes=['Text'])
-                                            for line in region.get_TextLine()
-                                            for word in line.get_Word()
-                                            for glyph in word.get_Glyph()
-                                            if glyph.id == error.ID), None)
-                        else:
-                            LOG.error("Unrepairable error for unknown segment type: %s",
-                                      str(error))
+        # shrink/expand text regions to the hull of their text lines
+        if self.parameter['sanitize']:
+            page_image, page_coords, _ = self.workspace.image_from_page(
+                page, page_id,
+                feature_selector='binarized',
+                feature_filter='clipped')
+            shrink_regions(page_image, page_coords, page, page_id, self.logger,
+                           padding=self.parameter['sanitize_padding'])
+        #
+        # validate segmentation (warn of children extending beyond their parents)
+        #
+        report = PageValidator.validate(ocrd_page=pcgts,
+                                        page_textequiv_consistency='off',
+                                        check_baseline=False)
+        if not report.is_valid:
+            errors = report.errors
+            report.errors = []
+            for error in errors:
+                if isinstance(error, (CoordinateConsistencyError,CoordinateValidityError)):
+                    if error.tag == 'Page':
+                        element = page.get_Border()
+                    elif error.tag.endswith('Region'):
+                        element = next((region
+                                        for region in page.get_AllRegions()
+                                        if region.id == error.ID), None)
+                    elif error.tag == 'TextLine':
+                        element = next((line
+                                        for region in page.get_AllRegions(classes=['Text'])
+                                        for line in region.get_TextLine()
+                                        if line.id == error.ID), None)
+                    elif error.tag == 'Word':
+                        element = next((word
+                                        for region in page.get_AllRegions(classes=['Text'])
+                                        for line in region.get_TextLine()
+                                        for word in line.get_Word()
+                                        if word.id == error.ID), None)
+                    elif error.tag == 'Glyph':
+                        element = next((glyph
+                                        for region in page.get_AllRegions(classes=['Text'])
+                                        for line in region.get_TextLine()
+                                        for word in line.get_Word()
+                                        for glyph in word.get_Glyph()
+                                        if glyph.id == error.ID), None)
+                    else:
+                        self.logger.error("Unrepairable error for unknown segment type: %s",
+                                  str(error))
+                        report.add_error(error)
+                        continue
+                    if not element:
+                        self.logger.error("Unrepairable error for unknown segment element: %s",
+                                  str(error))
+                        report.add_error(error)
+                        continue
+                    if isinstance(error, CoordinateConsistencyError):
+                        try:
+                            ensure_consistent(element)
+                        except Exception as e:
+                            self.logger.error(str(e)) # exc_info=e
                             report.add_error(error)
                             continue
-                        if not element:
-                            LOG.error("Unrepairable error for unknown segment element: %s",
-                                      str(error))
-                            report.add_error(error)
-                            continue
-                        if isinstance(error, CoordinateConsistencyError):
-                            try:
-                                ensure_consistent(element)
-                            except Exception as e:
-                                LOG.error(str(e)) # exc_info=e
-                                report.add_error(error)
-                                continue
-                        else:
-                            ensure_valid(element)
-                        LOG.warning("Fixed %s for %s '%s'", error.__class__.__name__,
-                                    error.tag, error.ID)
-            # show remaining errors
-            if not report.is_valid:
-                LOG.warning(report.to_xml())
+                    else:
+                        ensure_valid(element)
+                    self.logger.warning("Fixed %s for %s '%s'", error.__class__.__name__,
+                                error.tag, error.ID)
+        # show remaining errors
+        if not report.is_valid:
+            self.logger.warning(report.to_xml())
 
-            # simplify
-            if self.parameter['simplify']:
-                self.simplify_page(page, page_id)
-            # delete/merge/split redundant text regions (or its text lines)
-            if self.parameter['plausibilize']:
-                self.plausibilize_page(page, page_id)
-            if self.parameter['spread']:
-                self.spread_segments(page, page_id)
-
-            self.workspace.add_file(
-                ID=file_id,
-                file_grp=self.output_file_grp,
-                pageId=input_file.pageId,
-                mimetype=MIMETYPE_PAGE,
-                local_filename=os.path.join(self.output_file_grp,
-                                            file_id + '.xml'),
-                content=to_xml(pcgts))
+        # simplify
+        if self.parameter['simplify']:
+            self.simplify_page(page, page_id)
+        # delete/merge/split redundant text regions (or its text lines)
+        if self.parameter['plausibilize']:
+            self.plausibilize_page(page, page_id)
+        if self.parameter['spread']:
+            self.spread_segments(page, page_id)
+        return OcrdPageResult(pcgts)
 
     def simplify_page(self, page, page_id):
         if page.get_Border() is not None:
@@ -257,7 +234,7 @@ class RepairSegmentation(Processor):
                     if _compare_segments(region1, region2, regpoly1, regpoly2,
                                          marked_for_deletion, marked_for_merging,
                                          self.parameter['plausibilize_merge_min_overlap'],
-                                         page_id):
+                                         page_id, self.logger):
                         # non-trivial overlap: mutually plausibilize lines
                         linepolys1 = sorted([(line, make_valid(Polygon(polygon_from_points(line.get_Coords().points))))
                                              for line in region1.get_TextLine()],
@@ -270,7 +247,7 @@ class RepairSegmentation(Processor):
                                 if _compare_segments(line1, line2, linepoly1, linepoly2,
                                                      marked_for_deletion, marked_for_merging,
                                                      self.parameter['plausibilize_merge_min_overlap'],
-                                                     page_id):
+                                                     page_id, self.logger):
                                     # non-trivial overlap: check how close to each other
                                     if (linepoly1.centroid.within(linepoly2) or
                                         linepoly2.centroid.within(linepoly1)):
@@ -295,7 +272,8 @@ class RepairSegmentation(Processor):
             _plausibilize_segments(regpolys, rogroup,
                                    marked_for_deletion,
                                    marked_for_merging,
-                                   marked_for_splitting)
+                                   marked_for_splitting,
+                                   log)
 
     def spread_segments(self, page, page_id):
         level = self.parameter['spread_level']
@@ -329,7 +307,7 @@ class RepairSegmentation(Processor):
                     glyphs = word.get_Glyph()
                     spread_segments(glyphs, self.parameter['spread'])
 
-def _compare_segments(seg1, seg2, poly1, poly2, marked_for_deletion, marked_for_merging, min_overlap, page_id):
+def _compare_segments(seg1, seg2, poly1, poly2, marked_for_deletion, marked_for_merging, min_overlap, page_id, log):
     """Determine redundancies in a pair of regions/lines
 
     \b
@@ -343,29 +321,28 @@ def _compare_segments(seg1, seg2, poly1, poly2, marked_for_deletion, marked_for_
     Return whether something else besides deletion must be done about the redundancy,
     i.e. true iff they overlap, but neither side could be marked for deletion.
     """
-    LOG = getLogger('processor.RepairSegmentation')
-    # LOG.debug('Comparing %s and %s',
+    # log.debug('Comparing %s and %s',
     #           '%s "%s"' % (_tag_name(seg1), seg1.id),
     #           '%s "%s"' % (_tag_name(seg2), seg2.id))
     if poly1.almost_equals(poly2):
-        LOG.debug('Page "%s" %s is almost equal to %s', page_id,
+        log.debug('Page "%s" %s is almost equal to %s', page_id,
                   '%s "%s"' % (_tag_name(seg2), seg2.id),
                   '%s "%s"' % (_tag_name(seg1), seg1.id))
         marked_for_deletion.append(seg2.id)
     elif poly1.contains(poly2):
-        LOG.debug('Page "%s" %s is within %s', page_id,
+        log.debug('Page "%s" %s is within %s', page_id,
                   '%s "%s"' % (_tag_name(seg2), seg2.id),
                   '%s "%s"' % (_tag_name(seg1), seg1.id))
         marked_for_deletion.append(seg2.id)
     elif poly2.contains(poly1):
-        LOG.debug('Page "%s" %s is within %s', page_id,
+        log.debug('Page "%s" %s is within %s', page_id,
                   '%s "%s"' % (_tag_name(seg1), seg1.id),
                   '%s "%s"' % (_tag_name(seg2), seg2.id))
         marked_for_deletion.append(seg1.id)
     elif poly1.overlaps(poly2):
         inter_poly = poly1.intersection(poly2)
         union_poly = poly1.union(poly2)
-        LOG.debug('Page "%s" %s overlaps %s by %.2f/%.2f', page_id,
+        log.debug('Page "%s" %s overlaps %s by %.2f/%.2f', page_id,
                   '%s "%s"' % (_tag_name(seg1), seg1.id),
                   '%s "%s"' % (_tag_name(seg2), seg2.id),
                   inter_poly.area/poly1.area, inter_poly.area/poly2.area)
@@ -373,12 +350,12 @@ def _compare_segments(seg1, seg2, poly1, poly2, marked_for_deletion, marked_for_
             # skip this pair -- combined polygon encloses previously free segments
             return True
         elif inter_poly.area / poly2.area > min_overlap:
-            LOG.debug('Page "%s" %s belongs to %s', page_id,
+            log.debug('Page "%s" %s belongs to %s', page_id,
                       '%s "%s"' % (_tag_name(seg2), seg2.id),
                       '%s "%s"' % (_tag_name(seg1), seg1.id))
             marked_for_merging[seg2.id] = seg1
         elif inter_poly.area / poly1.area > min_overlap:
-            LOG.debug('Page "%s" %s belongs to %s', page_id,
+            log.debug('Page "%s" %s belongs to %s', page_id,
                       '%s "%s"' % (_tag_name(seg1), seg1.id),
                       '%s "%s"' % (_tag_name(seg2), seg2.id))
             marked_for_merging[seg1.id] = seg2
@@ -387,7 +364,7 @@ def _compare_segments(seg1, seg2, poly1, poly2, marked_for_deletion, marked_for_
 
     return False
 
-def _merge_segments(seg, superseg, poly, superpoly, segpolys, reading_order):
+def _merge_segments(seg, superseg, poly, superpoly, segpolys, reading_order, log):
     """Merge one segment into another and update reading order refs.
 
     \b
@@ -404,8 +381,7 @@ def _merge_segments(seg, superseg, poly, superpoly, segpolys, reading_order):
     and elements like TextStyle and TextEquiv, if different between ``seg``
     and ``superseg``.
     """
-    LOG = getLogger('processor.RepairSegmentation')
-    LOG.info('Merging %s "%s" into %s "%s"', 
+    log.info('Merging %s "%s" into %s "%s"', 
              _tag_name(seg), seg.id, 
              _tag_name(superseg), superseg.id)
     # granularity will necessarily be lost here --
@@ -423,7 +399,7 @@ def _merge_segments(seg, superseg, poly, superpoly, segpolys, reading_order):
     superseg.get_Coords().set_points(points_from_polygon(superpoly))
     # FIXME should we merge/mix attributes and features?
     if hasattr(seg, 'TextLine') and seg.get_TextLine():
-        LOG.info('Merging region "{}" with {} text lines into "{}" with {}'.format(
+        log.info('Merging region "{}" with {} text lines into "{}" with {}'.format(
             seg.id, len(seg.get_TextLine()),
             superseg.id, len(superseg.get_TextLine())))
         if (seg.id in reading_order and
@@ -440,7 +416,7 @@ def _merge_segments(seg, superseg, poly, superpoly, segpolys, reading_order):
         else:
             superseg.TextLine = superseg.TextLine + seg.TextLine
     elif hasattr(seg, 'Word') and seg.get_Word():
-        LOG.info('Merging line "{}" with {} words into "{}" with {}'.format(
+        log.info('Merging line "{}" with {} words into "{}" with {}'.format(
             seg.id, len(seg.get_Word()),
             superseg.id, len(superseg.get_Word())))
         pos = next(i for i, segpoly in enumerate(segpolys) if segpoly[0] == seg)
@@ -451,31 +427,31 @@ def _merge_segments(seg, superseg, poly, superpoly, segpolys, reading_order):
         else:
             superseg.Word = superseg.Word + seg.Word
     if hasattr(seg, 'orientation') and seg.get_orientation() != superseg.get_orientation():
-        LOG.warning('Merging "{}" with orientation {} into "{}" with {}'.format(
+        log.warning('Merging "{}" with orientation {} into "{}" with {}'.format(
             seg.id, seg.get_orientation(),
             superseg.id, superseg.get_orientation()))
     if hasattr(seg, 'type_') and seg.get_type() != superseg.get_type():
-        LOG.warning('Merging "{}" with type {} into "{}" with {}'.format(
+        log.warning('Merging "{}" with type {} into "{}" with {}'.format(
             seg.id, seg.get_type(),
             superseg.id, superseg.get_type()))
     if seg.get_primaryScript() != superseg.get_primaryScript():
-        LOG.warning('Merging "{}" with primaryScript {} into "{}" with {}'.format(
+        log.warning('Merging "{}" with primaryScript {} into "{}" with {}'.format(
             seg.id, seg.get_primaryScript(),
             superseg.id, superseg.get_primaryScript()))
     if seg.get_primaryLanguage() != superseg.get_primaryLanguage():
-        LOG.warning('Merging "{}" with primaryLanguage {} into "{}" with {}'.format(
+        log.warning('Merging "{}" with primaryLanguage {} into "{}" with {}'.format(
             seg.id, seg.get_primaryLanguage(),
             superseg.id, superseg.get_primaryLanguage()))
     if seg.get_TextStyle():
-        LOG.warning('Merging "{}" with TextStyle {} into "{}" with {}'.format(
+        log.warning('Merging "{}" with TextStyle {} into "{}" with {}'.format(
             seg.id, seg.get_TextStyle(), # FIXME needs repr...
             superseg.id, superseg.get_TextStyle())) # ...to be informative
     if seg.get_TextEquiv():
-        LOG.warning('Merging "{}" with TextEquiv {} into "{}" with {}'.format(
+        log.warning('Merging "{}" with TextEquiv {} into "{}" with {}'.format(
             seg.id, seg.get_TextEquiv(), # FIXME needs repr...
             superseg.id, superseg.get_TextEquiv())) # ...to be informative
 
-def _plausibilize_segments(segpolys, rogroup, marked_for_deletion, marked_for_merging, marked_for_splitting):
+def _plausibilize_segments(segpolys, rogroup, marked_for_deletion, marked_for_merging, marked_for_splitting, log):
     """Remove redundancy among a set of segments by applying deletion/merging/splitting
 
     \b
@@ -487,16 +463,20 @@ def _plausibilize_segments(segpolys, rogroup, marked_for_deletion, marked_for_me
 
     Finally, update the reading order ``rogroup`` accordingly.
     """
-    LOG = getLogger('processor.RepairSegmentation')
     wait_for_deletion = list()
     reading_order = dict()
     page_get_reading_order(reading_order, rogroup)
     for seg, poly in segpolys:
         if isinstance(seg, TextRegionType):
             # plausibilize lines first
-            _plausibilize_segments([(line, make_valid(Polygon(polygon_from_points(line.get_Coords().points))))
-                                 for line in seg.get_TextLine()], None,
-                                marked_for_deletion, marked_for_merging, marked_for_splitting)
+            linepolys = [(line, make_valid(Polygon(polygon_from_points(line.get_Coords().points))))
+                         for line in seg.get_TextLine()]
+            _plausibilize_segments(linepolys,
+                                   None, # no reading order on line level
+                                   marked_for_deletion,
+                                   marked_for_merging,
+                                   marked_for_splitting,
+                                   log)
         delete = seg.id in marked_for_deletion
         merge = seg.id in marked_for_merging
         split = seg.id in marked_for_splitting
@@ -505,13 +485,13 @@ def _plausibilize_segments(segpolys, rogroup, marked_for_deletion, marked_for_me
                 # merge region with super region:
                 superseg = marked_for_merging[seg.id]
                 superpoly = make_valid(Polygon(polygon_from_points(superseg.get_Coords().points)))
-                _merge_segments(seg, superseg, poly, superpoly, segpolys, reading_order)
+                _merge_segments(seg, superseg, poly, superpoly, segpolys, reading_order, log)
             wait_for_deletion.append(seg)
             if seg.id in reading_order:
                 regionref = reading_order[seg.id]
                 # TODO: re-assign regionref.continuation and regionref.type to other?
                 # could be any of the 6 types above:
-                regionrefs = regionref.parent_object_.__getattribute__(regionref.__class__.__name__.replace('Type', ''))
+                regionrefs = getattr(regionref.parent_object_, regionref.__class__.__name__.replace('Type', ''))
                 # remove in-place
                 regionrefs.remove(regionref)
                 if hasattr(regionref, 'index'):
@@ -519,7 +499,7 @@ def _plausibilize_segments(segpolys, rogroup, marked_for_deletion, marked_for_me
                     regionref.parent_object_.sort_AllIndexed()
         elif split:
             otherseg = marked_for_splitting[seg.id]
-            LOG.info('Shrinking %s "%s" in favour of %s "%s"', 
+            log.info('Shrinking %s "%s" in favour of %s "%s"', 
                      _tag_name(seg), seg.id, 
                      _tag_name(otherseg), otherseg.id)
             otherpoly = make_valid(Polygon(polygon_from_points(otherseg.get_Coords().points)))
@@ -535,7 +515,7 @@ def _plausibilize_segments(segpolys, rogroup, marked_for_deletion, marked_for_me
     for seg in wait_for_deletion:
         if seg.parent_object_:
             # remove in-place
-            LOG.info('Deleting %s "%s"', _tag_name(seg), seg.id)
+            log.info('Deleting %s "%s"', _tag_name(seg), seg.id)
             getattr(seg.parent_object_, 'get_' + _tag_name(seg))().remove(seg)
 
 def page_get_reading_order(ro, rogroup):
@@ -562,9 +542,8 @@ def page_get_reading_order(ro, rogroup):
             # recursive reading order element (un/ordered group):
             page_get_reading_order(ro, elem)
 
-def shrink_regions(page_image, page_coords, page, page_id, padding=0):
+def shrink_regions(page_image, page_coords, page, page_id, log, padding=0):
     """Shrink each region outline to become the minimal concave hull of its binary foreground."""
-    LOG = getLogger('processor.RepairSegmentation')
     page_array = ~ np.array(page_image.convert('1'))
     page_polygon = page_poly(page)
     if page.get_Border():
@@ -579,7 +558,7 @@ def shrink_regions(page_image, page_coords, page, page_id, padding=0):
     else:
         scale = 43
     for region in page.get_AllRegions():
-        #LOG.info('Shrinking region "%s"', region.id)
+        #log.info('Shrinking region "%s"', region.id)
         region_mask = np.zeros_like(page_array, dtype=bool)
         region_polygon = coordinates_of_segment(region, page_image, page_coords)
         region_mask[draw.polygon(region_polygon[:, 1],
@@ -594,7 +573,7 @@ def shrink_regions(page_image, page_coords, page, page_id, padding=0):
         total_area = sum(areas)
         if not total_area:
             # ignore if too small
-            LOG.warning('Zero contour area in region "%s"', region.id)
+            log.warning('Zero contour area in region "%s"', region.id)
             continue
         # pick contour and convert to absolute:
         region_polygon = join_polygons([make_valid(Polygon(contour[:, 0, ::]))
@@ -607,7 +586,7 @@ def shrink_regions(page_image, page_coords, page, page_id, padding=0):
         if not region_polygon.within(page_polygon):
             region_polygon = clip_poly(region_polygon, page_polygon)
         if region_polygon is not None:
-            LOG.debug('Using new coordinates for region "%s"', region.id)
+            log.debug('Using new coordinates for region "%s"', region.id)
             region.get_Coords().set_points(points_from_polygon(region_polygon.exterior.coords[:-1]))
 
 def spread_segments(segments, distance=0):

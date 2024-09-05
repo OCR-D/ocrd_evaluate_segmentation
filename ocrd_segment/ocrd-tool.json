@@ -6,13 +6,8 @@
       "executable": "ocrd-segment-repair",
       "categories": ["Layout analysis"],
       "description": "Analyse and repair region segmentation; at least ensure validity and consistency of coordinates.",
-      "input_file_grp": [
-        "OCR-D-IMG",
-        "OCR-D-SEG-BLOCK"
-      ],
-      "output_file_grp": [
-        "OCR-D-SEG-BLOCK"
-      ],
+      "input_file_grp_cardinality": 1,
+      "output_file_grp_cardinality": 1,
       "steps": ["layout/segmentation/region"],
       "parameters": {
         "sanitize": {
@@ -65,12 +60,8 @@
       "executable": "ocrd-segment-project",
       "categories": ["Layout analysis"],
       "description": "Project segment coordinates to their structural parents",
-      "input_file_grp": [
-        "OCR-D-SEG-BLOCK"
-      ],
-      "output_file_grp": [
-        "OCR-D-SEG-BLOCK"
-      ],
+      "input_file_grp_cardinality": 1,
+      "output_file_grp_cardinality": 1,
       "steps": ["layout/segmentation"],
       "parameters": {
         "level-of-operation": {
@@ -92,13 +83,8 @@
       "executable": "ocrd-segment-from-masks",
       "categories": ["Layout analysis"],
       "description": "Import region segmentation from mask images (segments filled with colors encoding classes). Input fileGrp format is `base,mask` (i.e. PAGE or original image files first, mask image files second).",
-      "input_file_grp": [
-        "OCR-D-IMG",
-        "OCR-D-SEG-PAGE"
-      ],
-      "output_file_grp": [
-        "OCR-D-SEG-BLOCK"
-      ],
+      "input_file_grp_cardinality": 2,
+      "output_file_grp_cardinality": 1,
       "steps": ["layout/segmentation/region"],
       "parameters": {
         "colordict": {
@@ -164,30 +150,29 @@
       "executable": "ocrd-segment-from-coco",
       "categories": ["Layout analysis"],
       "description": "Import region segmentation from COCO detection format JSON (for all pages). Input fileGrp format is `base,COCO` (i.e. PAGE or original image files first, COCO file second).",
-      "input_file_grp": [
-        "OCR-D-IMG",
-        "OCR-D-SEG-PAGE"
-      ],
-      "output_file_grp": [
-        "OCR-D-SEG-BLOCK"
-      ],
+      "input_file_grp_cardinality": 2,
+      "output_file_grp_cardinality": 1,
       "steps": ["layout/segmentation/region"],
       "parameters": {
+        "categorydict": {
+          "type": "object",
+          "description": "How to map COCO category names to PAGE segment types (except if 'source=PAGE'). Format is category[:subcategory] to type[:subtype], e.g. \"text:title\": \"TextRegion:heading\". Defaults to recommended PubLayNet rules.",
+          "default": {
+            "text": "TextRegion:paragraph",
+            "title": "TextRegion:heading",
+            "list": "TextRegion:list-label",
+            "table": "TableRegion",
+            "figure": "ImageRegion"
+          }
+        }
       }
     },
     "ocrd-segment-extract-pages": {
       "executable": "ocrd-segment-extract-pages",
       "categories": ["Image preprocessing"],
       "description": "Extract page segmentation as page images (deskewed according to `/Page/@orientation` and cropped+masked along `/Page/Border`) + JSON (including region coordinates/classes and meta-data), as binarized images, and as mask images (segments filled with colors encoding classes) + COCO detection format JSON (for all pages). Output fileGrp format is `raw[,binarized[,mask]]` (i.e. fall back to first group).",
-      "input_file_grp": [
-        "OCR-D-SEG-PAGE",
-        "OCR-D-GT-SEG-PAGE",
-        "OCR-D-SEG-BLOCK",
-        "OCR-D-GT-SEG-BLOCK"
-      ],
-      "output_file_grp": [
-        "OCR-D-IMG-PAGE"
-      ],
+      "input_file_grp_cardinality": 1,
+      "output_file_grp_cardinality": [1, 3],
       "steps": ["layout/analysis"],
       "parameters": {
         "feature_filter": {
@@ -289,13 +274,8 @@
       "executable": "ocrd-segment-extract-regions",
       "categories": ["Image preprocessing"],
       "description": "Extract region segmentation as region images (deskewed according to `*/@orientation` and cropped+masked along `*/Coords` polygon) + JSON (including region coordinates/classes and meta-data).",
-      "input_file_grp": [
-        "OCR-D-SEG-BLOCK",
-        "OCR-D-GT-SEG-BLOCK"
-      ],
-      "output_file_grp": [
-        "OCR-D-IMG-REGION"
-      ],
+      "input_file_grp_cardinality": 1,
+      "output_file_grp_cardinality": 1,
       "steps": ["layout/analysis"],
       "parameters": {
         "feature_filter": {
@@ -361,13 +341,8 @@
       "executable": "ocrd-segment-extract-lines",
       "categories": ["Image preprocessing"],
       "description": "Extract line segmentation as line images + text file + JSON.",
-      "input_file_grp": [
-        "OCR-D-SEG-LINE",
-        "OCR-D-GT-SEG-LINE"
-      ],
-      "output_file_grp": [
-        "OCR-D-IMG-LINE"
-      ],
+      "input_file_grp_cardinality": 1,
+      "output_file_grp_cardinality": 1,
       "steps": ["layout/analysis"],
       "parameters": {
         "feature_filter": {
@@ -434,13 +409,8 @@
       "executable": "ocrd-segment-extract-words",
       "categories": ["Image preprocessing"],
       "description": "Extract word segmentation as word images (deskewed according to `*/@orientation` and cropped+masked along `*/Coords` polygon and dewarped as in `*/AlternativeImage`) + text file (according to `*/TextEquiv`) + JSON (including line coordinates and meta-data).",
-      "input_file_grp": [
-        "OCR-D-SEG-WORD",
-        "OCR-D-GT-SEG-WORD"
-      ],
-      "output_file_grp": [
-        "OCR-D-IMG-WORD"
-      ],
+      "input_file_grp_cardinality": 1,
+      "output_file_grp_cardinality": 1,
       "steps": ["layout/analysis"],
       "parameters": {
         "feature_filter": {
@@ -465,13 +435,8 @@
       "executable": "ocrd-segment-extract-glyphs",
       "categories": ["Image preprocessing"],
       "description": "Extract glyph segmentation as glyph images (deskewed according to `*/@orientation` and cropped+masked along `*/Coords` polygon and dewarped as in `*/AlternativeImage`) + text file (according to `*/TextEquiv`) + JSON (including line coordinates and meta-data).",
-      "input_file_grp": [
-        "OCR-D-SEG-GLYPH",
-        "OCR-D-GT-SEG-GLYPH"
-      ],
-      "output_file_grp": [
-        "OCR-D-IMG-GLYPH"
-      ],
+      "input_file_grp_cardinality": 1,
+      "output_file_grp_cardinality": 1,
       "steps": ["layout/analysis"],
       "parameters": {
         "feature_filter": {
@@ -496,14 +461,8 @@
       "executable": "ocrd-segment-replace-original",
       "categories": ["Image preprocessing"],
       "description": "Extract page image (deskewed according to `/Page/@orientation` and cropped+masked along `/Page/Border`) and use it as @imageFilename, adjusting all coordinates",
-      "input_file_grp": [
-        "OCR-D-SEG-LINE",
-        "OCR-D-GT-SEG-LINE",
-        "OCR-D-OCR"
-      ],
-      "output_file_grp": [
-        "OCR-D-SEG-CROP"
-      ],
+      "input_file_grp_cardinality": 1,
+      "output_file_grp_cardinality": 1,
       "steps": ["layout/analysis"],
       "parameters": {
           "feature_selector": {
@@ -527,15 +486,8 @@
       "executable": "ocrd-segment-replace-page",
       "categories": ["Image preprocessing"],
       "description": "Replace everything below page level with another annotation, adjusting all coordinates",
-      "input_file_grp": [
-        "OCR-D-SEG-LINE",
-        "OCR-D-GT-SEG-LINE",
-        "OCR-D-OCR"
-      ],
-      "output_file_grp": [
-        "OCR-D-SEG-LINE",
-        "OCR-D-OCR"
-      ],
+      "input_file_grp_cardinality": 2,
+      "output_file_grp_cardinality": 1,
       "steps": ["layout/analysis"],
       "parameters": {
           "transform_coordinates": {
@@ -549,6 +501,8 @@
       "executable": "ocrd-segment-replace-text",
       "categories": ["Text recognition and optimization"],
       "description": "Insert text from annotations in single-segment text files",
+      "input_file_grp_cardinality": 1,
+      "output_file_grp_cardinality": 1,
       "steps": ["recognition/post-correction"],
       "parameters": {
         "file_glob": {
@@ -562,10 +516,8 @@
       "executable": "ocrd-segment-evaluate",
       "categories": ["Layout analysis"],
       "description": "Compare segmentations",
-      "input_file_grp": [
-        "OCR-D-GT-SEG-BLOCK",
-        "OCR-D-SEG-BLOCK"
-      ],
+      "input_file_grp_cardinality": 2,
+      "output_file_grp_cardinality": 1,
       "steps": ["layout/analysis"],
       "parameters": {
         "level-of-operation": {

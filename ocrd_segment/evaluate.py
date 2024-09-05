@@ -2,6 +2,7 @@ from __future__ import absolute_import
 
 import sys
 import os
+from typing import Optional
 import json
 from itertools import chain
 import click
@@ -10,17 +11,15 @@ from skimage import draw
 from PIL import Image
 from shapely.geometry import Polygon
 
-from ocrd import Processor
+from ocrd import Workspace, Processor
 from ocrd_utils import (
     getLogger,
     initLogging,
-    assert_file_grp_cardinality,
     xywh_from_polygon,
     polygon_from_points,
     coordinates_of_segment,
     MIMETYPE_PAGE
 )
-from ocrd_modelfactory import page_from_file
 from ocrd_models.ocrd_page import parse as parse_page
 
 from pycocotools.coco import COCO
@@ -31,45 +30,37 @@ from pycocotools.mask import (
     area as maskArea
 )
 
-from .config import OCRD_TOOL
-
-TOOL = 'ocrd-segment-evaluate'
-
 class EvaluateSegmentation(Processor):
 
-    def __init__(self, *args, **kwargs):
-        kwargs['ocrd_tool'] = OCRD_TOOL['tools'][TOOL]
-        kwargs['version'] = OCRD_TOOL['version']
-        super(EvaluateSegmentation, self).__init__(*args, **kwargs)
+    @property
+    def executable(self):
+        return 'ocrd-segment-evaluate'
 
-    def process(self):
+    def process_workspace(self, workspace: Workspace) -> None:
         """Performs segmentation evaluation with pycocotools on the workspace.
-        
+
         Open and deserialize PAGE files from the first and second input file group
         (the first as ground truth, the second as prediction).
         Then iterate over the element hierarchy down to ``level-of-operation``.
         Aggregate and convert all pages' segmentation (coordinates and classes)
         to COCO:
 
+        \b
         - On the region level, unless ``ignore-subtype``, differentiate segment
           classes by their `@type`, if applicable.
         - On the region level, unless ``for-categories`` is empty, select only
           segment classes in that (comma-separated) list.
         - If ``only-fg``, then use the foreground mask from the binarized
           image inside each segment for overlap calculations.
-        
+
         Next, configure and run COCOEval for comparison of all pages. Show the matching
         pairs (GT segment ID, prediction segment ID, IoU) for every overlap on each page.
         Also, calculate per-class precision and recall (at the point of maximum recall).
         Finally, get the typical summary mean average precision / recall (but without
         restriction on the number of segments).
-        
+
         Write a JSON report to the output file group.
         """
-        LOG = getLogger('processor.EvaluateSegmentation')
-
-        assert_file_grp_cardinality(self.output_file_grp, 1)
-        assert_file_grp_cardinality(self.input_file_grp, 2, 'GT and evaluation data')
         # region or line level?
         level = self.parameter['level-of-operation']
         onlyfg = self.parameter['only-fg']
@@ -77,10 +68,13 @@ class EvaluateSegmentation(Processor):
         selected = self.parameter['for-categories']
         if selected:
             selected = selected.split(',')
+        self.workspace = workspace
+        self.verify()
+        # FIXME: add configurable error handling as in super().process_workspace()
         # get input file groups
         ifgs = self.input_file_grp.split(",")
         # get input file tuples
-        ifts = self.zip_input_files(mimetype=MIMETYPE_PAGE)
+        ifts = self.zip_input_files(mimetype=MIMETYPE_PAGE, require_first=False)
         # convert to 2 COCO datasets from all page pairs
         categories = ["bg"] # needed by cocoeval
         images = []
@@ -89,14 +83,18 @@ class EvaluateSegmentation(Processor):
         for ift in ifts:
             file_gt, file_dt = ift
             if not file_gt:
-                LOG.warning("skipping page %s missing from GT", file_gt.pageId)
+                self.logger.warning("skipping page %s missing from GT", file_gt.pageId)
                 continue
             if not file_dt:
-                LOG.warning("skipping page %s missing from prediction", file_gt.pageId)
+                self.logger.warning("skipping page %s missing from prediction", file_gt.pageId)
                 continue
-            LOG.info("processing page %s", file_gt.pageId)
-            pcgts_gt = page_from_file(self.workspace.download_file(file_gt))
-            pcgts_dt = page_from_file(self.workspace.download_file(file_dt))
+            self.logger.info("processing page %s", file_gt.pageId)
+            if self.download:
+                file_gt = self.workspace.download_file(file_gt)
+                file_dt = self.workspace.download_file(file_dt)
+            with pushd_popd(self.workspace.directory):
+                pcgts_gt = page_from_file(file_gt)
+                pcgts_dt = page_from_file(file_dt)
             page_gt = pcgts_gt.get_Page()
             page_dt = pcgts_dt.get_Page()
             if onlyfg:
@@ -115,11 +113,13 @@ class EvaluateSegmentation(Processor):
             _add_annotations(annotations_gt, page_gt, imgid, categories,
                              level=level, typed=typed,
                              coords=page_coords if onlyfg else None,
-                             mask=page_mask if onlyfg else None)
+                             mask=page_mask if onlyfg else None,
+                             log=self.logger)
             _add_annotations(annotations_dt, page_dt, imgid, categories,
                              level=level, typed=typed,
                              coords=page_coords if onlyfg else None,
-                             mask=page_mask if onlyfg else None)
+                             mask=page_mask if onlyfg else None,
+                             log=self.logger)
 
         if level == 'line':
             categories.append('textline')
@@ -130,17 +130,17 @@ class EvaluateSegmentation(Processor):
         _add_ids(annotations_gt, 1) # cocoeval expects annotation IDs starting at 1
         _add_ids(annotations_dt, 1) # cocoeval expects annotation IDs starting at 1
 
-        LOG.info(f"found {len(annotations_gt)} GT / {len(annotations_dt)} DT segments"
-                 f" in {len(categories) - 1} categories for {len(images)} images")
+        self.logger.info(f"found {len(annotations_gt)} GT / {len(annotations_dt)} DT segments"
+                         f" in {len(categories) - 1} categories for {len(images)} images")
 
         coco_gt = _create_coco(categories, images, annotations_gt)
         coco_dt = _create_coco(categories, images, annotations_dt)
 
-        stats = evaluate_coco(coco_gt, coco_dt, self.parameter, selected)
+        stats = evaluate_coco(coco_gt, coco_dt, self.parameter, selected, log=self.logger)
 
         # write regions to custom JSON for this page
         file_id = 'id' + self.output_file_grp + '_report'
-        self.workspace.add_file(
+        workspace.add_file(
             ID=file_id,
             file_grp=self.output_file_grp,
             pageId=None,
@@ -203,6 +203,7 @@ def standalone_cli(gt_page_filelst,
     \b
     Write a JSON report to the output file group.
     """
+    initLogging()
     assert (tabfile is None) == (gt_page_filelst is not None) == (dt_page_filelst is not None), \
         "pass file lists either as tab-separated single file or as separate files"
     if tabfile is None:
@@ -238,8 +239,7 @@ def standalone_cli(gt_page_filelst,
 
 # standalone entry point
 def evaluate_files(gt_files, dt_files, img_files=None, level='region', typed=True, selected=None):
-    initLogging()
-    LOG = getLogger('processor.EvaluateSegmentation')
+    log = getLogger('EvaluateSegmentation')
     categories = ["bg"] # needed by cocoeval
     images = []
     annotations_gt = []
@@ -249,7 +249,7 @@ def evaluate_files(gt_files, dt_files, img_files=None, level='region', typed=Tru
         pcgts_gt = parse_page(gt_file)
         pcgts_dt = parse_page(dt_file)
         page_id = pcgts_gt.pcGtsId or gt_file
-        LOG.info("processing page %s", page_id)
+        log.info("processing page %s", page_id)
         page_gt = pcgts_gt.get_Page()
         page_dt = pcgts_dt.get_Page()
         if img_file:
@@ -271,11 +271,13 @@ def evaluate_files(gt_files, dt_files, img_files=None, level='region', typed=Tru
         _add_annotations(annotations_gt, page_gt, imgid, categories,
                          level=level, typed=typed,
                          coords=page_coords if img_file else None,
-                         mask=page_mask if img_file else None)
+                         mask=page_mask if img_file else None,
+                         log=log)
         _add_annotations(annotations_dt, page_dt, imgid, categories,
                          level=level, typed=typed,
                          coords=page_coords if img_file else None,
-                         mask=page_mask if img_file else None)
+                         mask=page_mask if img_file else None,
+                         log=log)
 
     if level == 'line':
         categories.append('textline')
@@ -286,7 +288,7 @@ def evaluate_files(gt_files, dt_files, img_files=None, level='region', typed=Tru
     _add_ids(annotations_gt, 1) # cocoeval expects annotation IDs starting at 1
     _add_ids(annotations_dt, 1) # cocoeval expects annotation IDs starting at 1
 
-    LOG.info(f"found {len(annotations_gt)} GT / {len(annotations_dt)} DT segments"
+    log.info(f"found {len(annotations_gt)} GT / {len(annotations_dt)} DT segments"
              f" in {len(categories) - 1} categories for {len(images)} images")
 
     coco_gt = _create_coco(categories, images, annotations_gt)
@@ -299,9 +301,10 @@ def evaluate_files(gt_files, dt_files, img_files=None, level='region', typed=Tru
     stats = evaluate_coco(coco_gt, coco_dt, parameters, selected)
     return stats
 
-def evaluate_coco(coco_gt, coco_dt, parameters, catIds=None):
-    LOG = getLogger('processor.EvaluateSegmentation')
-    LOG.info("comparing segmentations")
+def evaluate_coco(coco_gt, coco_dt, parameters, catIds=None, log=None):
+    if log is None:
+        log = getLogger('EvaluateSegmentation')
+    log.info("comparing segmentations")
     stats = dict(parameters)
     coco_eval = COCOeval(coco_gt, coco_dt, 'segm') # bbox
     if catIds:
@@ -553,7 +556,7 @@ def _create_coco(categories, images, annotations):
     return coco
 
 def _add_annotations(annotations, page, imgid, categories,
-                     level='region', typed=True, coords=None, mask=None):
+                     level='region', typed=True, coords=None, mask=None, log=None):
     for region in page.get_AllRegions(classes=None if level == 'region' else ['Text']):
         if level == 'region':
             cat = region.__class__.__name__[:-4]
@@ -563,18 +566,19 @@ def _add_annotations(annotations, page, imgid, categories,
                 categories.append(cat)
             catid = categories.index(cat)
             _add_annotation(annotations, region, imgid, catid,
-                            coords=coords, mask=mask)
+                            coords=coords, mask=mask, log=log)
             continue
         for line in region.get_TextLine():
             _add_annotation(annotations, line, imgid, 1,
-                            coords=coords, mask=mask)
+                            coords=coords, mask=mask, log=log)
 
-def _add_annotation(annotations, segment, imgid, catid, coords=None, mask=None):
-    LOG = getLogger('processor.EvaluateSegmentation')
+def _add_annotation(annotations, segment, imgid, catid, coords=None, mask=None, log=None):
+    if log is None:
+        log = getLogger('EvaluateSegmentation')
     score = segment.get_Coords().get_conf() or 1.0
     polygon = polygon_from_points(segment.get_Coords().points)
     if len(polygon) < 3:
-        LOG.warning('ignoring segment "%s" with only %d points', segment.id, len(polygon))
+        log.warning('ignoring segment "%s" with only %d points', segment.id, len(polygon))
         return
     xywh = xywh_from_polygon(polygon)
     if mask is None:
